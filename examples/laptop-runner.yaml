@@ -1,0 +1,14 @@
+# A developer machine offering its locally installed agents to carrier.
+# No inbound port: the proxy dials out and carrier opens connections over it.
+listen: null
+dial:
+  url: wss://carrier.example.com/api/v1/acp/runners/connect
+  token: env:CARRIER_RUNNER_TOKEN
+  runner_id: val-laptop
+  labels: {os: linux}
+default_agent: claude
+agents:
+  claude:
+    command: [npx, -y, "@agentclientprotocol/claude-agent-acp"]   # uses your ~/.claude login
+  codex:
+    command: [npx, -y, "@zed-industries/codex-acp"]

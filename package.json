@@ -1,0 +1,32 @@
+{
+  "name": "acp-web-proxy",
+  "version": "0.1.0",
+  "description": "Serve a local ACP (Agent Client Protocol) agent over WebSocket: relay, reconnect with replay, launch hooks, dial-out runners.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "acp-web-proxy": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  }
+}

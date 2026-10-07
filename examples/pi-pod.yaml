@@ -1,0 +1,19 @@
+# acp-web-proxy in a carrier agent pod running the pi ACP agent.
+listen:
+  host: 0.0.0.0
+  port: 8000
+  path: /acp
+# Carrier generates one token per pod and passes it as an env var at spawn.
+tokens: [env:ACP_PROXY_TOKEN]
+default_agent: pi
+idle_timeout_s: 900          # carrier restart / network blip window
+agents:
+  pi:
+    command: [pi-carrier-agent]          # pi-cloud-agent's ACP mode (pi SDK, stdio)
+    cwd: /workspace
+  claude:
+    command: [claude-agent-acp]          # needs ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+    cwd: /workspace
+  codex:
+    command: [codex-acp]                 # needs CODEX_API_KEY / OPENAI_API_KEY
+    cwd: /workspace

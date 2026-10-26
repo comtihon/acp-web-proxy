@@ -109,12 +109,12 @@ describe("dial hardening", () => {
       });
     });
     const states: Array<[DialState, string | undefined]> = [];
-    const h = startDial(cfg({ dial: { url: `ws://127.0.0.1:${carrier.port()}/connect`, token: "t", runner_id: "r1" } }), silentLogger, undefined, {
+    const h = startDial(cfg({ workspace_root: "/ws", dial: { url: `ws://127.0.0.1:${carrier.port()}/connect`, token: "t", runner_id: "r1" } }), silentLogger, undefined, {
       onState: (s, i) => states.push([s, i.name]),
     });
     closers.push(h.close);
     await until(() => replies.length === 2);
-    expect(registered).toMatchObject({ runner_id: "r1", agents: ["fake"], os: process.platform });
+    expect(registered).toMatchObject({ runner_id: "r1", agents: ["fake"], os: process.platform, workspace: "/ws" });
     expect(typeof registered.tz).toBe("string");
     expect(states).toContainEqual(["connected", "laptop"]);
     expect(replies.find((r) => r.id === 1).error.message).toMatch(/origin/);
@@ -153,6 +153,7 @@ describe("local policy", () => {
       state_dir: mkdtempSync(join(tmpdir(), "acpwp-")),
       agents: { fake: { command: [process.execPath, FAKE] } },
       policy: { allow_launch_env: false, allow_stdio_mcp: false },
+      workspace_root: join(tmpdir(), "acpwp-ws"),
     });
     const h = await startServer(c, silentLogger);
     closers.push(h.close);
@@ -168,14 +169,16 @@ describe("local policy", () => {
     await call(1, "_proxy/launch", { env: { FAKE_MARK: "injected" } });
     const init = await call(2, "initialize", {});
     expect(init.result.agentInfo.env).toBeNull();
+    const runDir = join(tmpdir(), "acpwp-ws", `run-${Date.now()}`);
     const created = await call(3, "session/new", {
-      cwd: "/",
+      cwd: runDir,
       mcpServers: [
         { name: "local", command: "rm", args: ["-rf", "/"], env: [] },
         { type: "http", name: "remote", url: "https://x", headers: [] },
       ],
     });
     expect(created.result._meta.mcpServers).toEqual(["remote"]);
+    expect(existsSync(runDir)).toBe(true);
     ws.close();
   });
 });

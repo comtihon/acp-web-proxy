@@ -86,6 +86,11 @@ export interface ProxyConfig {
   state_dir: string;
   dial?: DialSpec | null;
   policy: PolicySpec;
+  /**
+   * Runner workspace: reported to the client on registration, and a session's
+   * `cwd` inside it is created on session/new and session/load.
+   */
+  workspace_root?: string;
 }
 
 export const DEFAULTS: Omit<ProxyConfig, "agents" | "default_agent"> = {
@@ -192,6 +197,7 @@ export function normalizeConfig(raw: Record<string, unknown>, env: NodeJS.Proces
     max_message_bytes: num(r.max_message_bytes, DEFAULTS.max_message_bytes),
     state_dir: (r.state_dir as string) ?? DEFAULTS.state_dir,
     dial,
+    workspace_root: typeof r.workspace_root === "string" && r.workspace_root ? r.workspace_root : undefined,
     policy: {
       allow_launch_env: bool((r.policy as Record<string, unknown> | undefined)?.allow_launch_env, true),
       allow_stdio_mcp: bool((r.policy as Record<string, unknown> | undefined)?.allow_stdio_mcp, true),

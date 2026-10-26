@@ -89,7 +89,7 @@ JSON-RPC 2.0, one frame per text message.
 
 | Direction | Method | Params | Result |
 |---|---|---|---|
-| runner → carrier | `_proxy/register` | `{runner_id, agents, default_agent, labels, version, hostname, os, arch, tz}` | `{runner_id, name}` |
+| runner → carrier | `_proxy/register` | `{runner_id, agents, default_agent, labels, version, hostname, os, arch, tz, workspace?}` | `{runner_id, name}` |
 | carrier → runner | `_proxy/open` | `{connection_id, last_seq, resume}` | `{connection_id}` |
 | carrier → runner | `_proxy/close` | `{connection_id}` | `{}` |
 | carrier → runner | `_proxy/ping` | – | `{connections}` |
@@ -116,7 +116,17 @@ policy:
 ```
 
 A runner executes what carrier asks on the user's machine; these keep carrier
-from choosing local commands or environment.
+from choosing local commands or environment. Carrier also never sends its own
+credentials (tool env) to a runner. Agents still answer permission requests
+automatically during a run, as they do in pods: connect a machine only for
+agents you are happy to let carrier's workflows drive.
+
+## Workspace
+
+`install` sets `workspace_root: ~/carrier-workspaces`; the runner reports it in
+`_proxy/register` and creates a session's `cwd` when it lies inside it.
+Carrier runs each step in `<workspace>/<run_id>` unless the agent sets
+`agent_input.acp_cwd` (e.g. a checkout of your repository).
 
 ## Usage limits
 

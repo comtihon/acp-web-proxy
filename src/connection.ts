@@ -19,7 +19,7 @@
  */
 
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSpec, ProxyConfig } from "./config.js";
 import { AgentProcess } from "./agentProcess.js";
@@ -184,8 +184,24 @@ export class Connection {
     this.agent!.send(this.applyPolicy(msg) ?? text);
   }
 
+  /** Create a session's working directory when it lies in the runner workspace. */
+  private ensureWorkspace(msg: JsonRpc): void {
+    const root = this.cfg.workspace_root;
+    if (!root || (msg.method !== "session/new" && msg.method !== "session/load")) return;
+    const cwd = (msg.params as { cwd?: unknown } | undefined)?.cwd;
+    if (typeof cwd !== "string" || !isAbsolute(cwd)) return;
+    const rel = relative(resolve(root), resolve(cwd));
+    if (rel.startsWith("..") || isAbsolute(rel)) return;
+    try {
+      mkdirSync(cwd, { recursive: true });
+    } catch (err) {
+      this.log.warn("could not create session directory", { connection: this.id, cwd, err: String(err) });
+    }
+  }
+
   /** The frame to send instead of the client's, when policy changes it. */
   private applyPolicy(msg: JsonRpc): string | null {
+    this.ensureWorkspace(msg);
     if (this.cfg.policy.allow_stdio_mcp) return null;
     if (msg.method !== "session/new" && msg.method !== "session/load") return null;
     const params = msg.params as { mcpServers?: Array<Record<string, unknown>> } | undefined;

@@ -2,6 +2,7 @@
 import { readFileSync, realpathSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { stringify as stringifyYaml } from "yaml";
 import { loadConfig, normalizeConfig, type ProxyConfig } from "./config.js";
@@ -154,6 +155,8 @@ function writeRunnerConfig(home: Home, carrierUrl: string, agents: Record<string
     // A turn can outlive a short network drop or a carrier restart.
     idle_timeout_s: 3600,
     policy: { allow_launch_env: false, allow_stdio_mcp: false },
+    // Each carrier run gets a directory here (unless its agent names another cwd).
+    workspace_root: join(homedir(), "carrier-workspaces"),
     agents,
   };
   home.ensure();

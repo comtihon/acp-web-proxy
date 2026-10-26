@@ -4,7 +4,7 @@
  *
  *   control socket  wss://<url>                      (Authorization: Bearer <token>)
  *     proxy → client  _proxy/register {runner_id, agents, default_agent, labels,
- *                       version, hostname, os, arch, tz}             → {runner_id, name}
+ *                       version, hostname, os, arch, tz, workspace?}  → {runner_id, name}
  *     client → proxy  _proxy/open {connection_id?, last_seq?, resume?, url?} → {connection_id}
  *     client → proxy  _proxy/close {connection_id}                    → {}
  *     client → proxy  _proxy/ping                                      → {connections}
@@ -78,6 +78,7 @@ export function registerParams(cfg: ProxyConfig): Record<string, unknown> {
     os: process.platform,
     arch: process.arch,
     tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    ...(cfg.workspace_root ? { workspace: cfg.workspace_root } : {}),
   };
 }
 

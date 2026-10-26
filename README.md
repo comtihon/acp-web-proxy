@@ -24,6 +24,23 @@ drive it over a WebSocket, with what a network needs and stdio does not:
 Frames are relayed **unmodified**; the proxy only adds methods under the
 `_proxy/` prefix (ACP reserves `_`-prefixed methods for extensions).
 
+## Connect your machine to carrier
+
+```bash
+npx -y github:comtihon/acp-web-proxy install https://carrier.example.com
+```
+
+This finds the coding agents installed here (Claude Code, Codex, Gemini CLI),
+installs a background service (launchd on macOS, systemd --user on Linux, a
+Startup-folder task on Windows) and prints an **approval number**. Enter that
+number in carrier's UI (Runners → Approve device); the machine's agents then
+show up in carrier and can be used in workflows. Check on it with
+`acp-web-proxy status`; remove it with `acp-web-proxy uninstall --purge`.
+
+Asking an agent works too — e.g. tell Claude Code *"install acp-web-proxy and
+connect it to https://carrier.example.com"*; it follows [INSTALL.md](INSTALL.md).
+How enrollment, revocation and reconnects work: [docs/runners.md](docs/runners.md).
+
 ## Quick start
 
 ```bash
@@ -117,12 +134,28 @@ dial:
   runner_id: my-laptop
 ```
 
-The proxy keeps a **control** socket to `url` and announces itself with
-`_proxy/register {runner_id, agents, default_agent, labels, version}`. The
-client asks for a connection with `_proxy/open {connection_id?, last_seq?, url?}`;
-the proxy then dials a **data** socket to `<url>/connections/<connection_id>`
-which behaves exactly like a listen-mode `/acp` socket. `_proxy/close
-{connection_id}` ends one. The control socket reconnects every `reconnect_s`.
+The proxy keeps a **control** socket to `url` and announces itself with the
+request `_proxy/register {runner_id, agents, default_agent, labels, version,
+hostname, os, arch, tz}`. The client asks for a connection with
+`_proxy/open {connection_id?, last_seq?, resume?, url?}`; the proxy then dials
+a **data** socket to `<url>/connections/<connection_id>` which behaves exactly
+like a listen-mode `/acp` socket (`url`, if given, must be on the same origin;
+`resume: true` fails for an unknown connection instead of creating one).
+`_proxy/close {connection_id}` ends one. The control socket reconnects with
+exponential backoff (`reconnect_s` … `reconnect_max_s`, with jitter) and stops
+for good when the client refuses the token (HTTP 401/403, close 4401/4403).
+
+### Local policy
+
+```yaml
+policy:
+  allow_launch_env: false   # ignore `env` in _proxy/launch
+  allow_stdio_mcp: false    # drop stdio MCP servers from session/new and session/load
+```
+
+Both default to `true`; `install` turns them off, so a remote client cannot
+choose commands or environment variables on your machine. String values may
+also be `file:PATH` (the file's trimmed contents).
 
 ## Relation to ACP's remote transport
 

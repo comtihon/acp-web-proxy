@@ -181,7 +181,21 @@ export class Connection {
       return;
     }
     if (msg.method && msg.id !== undefined && msg.id !== null) this.pending.set(idKey(msg.id), msg.method);
-    this.agent!.send(text);
+    this.agent!.send(this.applyPolicy(msg) ?? text);
+  }
+
+  /** The frame to send instead of the client's, when policy changes it. */
+  private applyPolicy(msg: JsonRpc): string | null {
+    if (this.cfg.policy.allow_stdio_mcp) return null;
+    if (msg.method !== "session/new" && msg.method !== "session/load") return null;
+    const params = msg.params as { mcpServers?: Array<Record<string, unknown>> } | undefined;
+    if (!Array.isArray(params?.mcpServers)) return null;
+    // ACP: http/sse servers carry a `type`; stdio servers (a local command) do not.
+    const isRemote = (s: Record<string, unknown>) => s.type === "http" || s.type === "sse";
+    const dropped = params!.mcpServers.filter((s) => !isRemote(s)).map((s) => String(s.name ?? "?"));
+    if (dropped.length === 0) return null;
+    this.log.warn("policy: dropped stdio MCP servers", { connection: this.id, servers: dropped });
+    return JSON.stringify({ ...msg, params: { ...params, mcpServers: params!.mcpServers.filter(isRemote) } });
   }
 
   private async handleProxyMethod(msg: JsonRpc): Promise<void> {
@@ -244,7 +258,11 @@ export class Connection {
     let command = [...spec.command];
     let cwd = spec.cwd;
     let extraEnv: Record<string, string> = {};
-    const callerEnv = (params.env as Record<string, string> | undefined) ?? {};
+    let callerEnv = (params.env as Record<string, string> | undefined) ?? {};
+    if (!this.cfg.policy.allow_launch_env && Object.keys(callerEnv).length > 0) {
+      this.log.warn("policy: ignored launch env", { connection: this.id, keys: Object.keys(callerEnv) });
+      callerEnv = {};
+    }
 
     if (spec.hooks?.prepare) {
       const res = await runHook(spec.hooks.prepare, JSON.stringify(launchConfig), { ...this.hookEnv, ...callerEnv }, cwd);

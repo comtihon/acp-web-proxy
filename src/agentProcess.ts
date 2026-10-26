@@ -2,8 +2,9 @@
  * One ACP agent subprocess: newline-delimited JSON-RPC on stdin/stdout.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { killTree, spawnArgv } from "./spawnCommand.js";
 
 export interface SpawnSpec {
   command: string[];
@@ -26,14 +27,14 @@ export class AgentProcess extends EventEmitter<AgentProcessEvents> {
 
   constructor(spec: SpawnSpec) {
     super();
-    const [cmd, ...args] = spec.command;
-    this.child = spawn(cmd, args, {
+    this.child = spawnArgv(spec.command, {
       cwd: spec.cwd,
       env: spec.env,
       stdio: ["pipe", "pipe", "pipe"],
       // Own process group, so shutdown reaches the agent's children too.
       detached: process.platform !== "win32",
-    });
+      windowsHide: true,
+    }) as ChildProcessWithoutNullStreams;
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.child.stderr.setEncoding("utf8");
@@ -86,17 +87,10 @@ export class AgentProcess extends EventEmitter<AgentProcessEvents> {
     return true;
   }
 
-  /** SIGTERM the process group, SIGKILL after `graceMs`. */
+  /** SIGTERM the process group, SIGKILL after `graceMs` (Windows: kill the tree). */
   async kill(graceMs = 5000): Promise<void> {
     if (this.exited) return;
-    const signalGroup = (sig: NodeJS.Signals) => {
-      try {
-        if (this.child.pid && process.platform !== "win32") process.kill(-this.child.pid, sig);
-        else this.child.kill(sig);
-      } catch {
-        /* already gone */
-      }
-    };
+    const signalGroup = (sig: NodeJS.Signals) => killTree(this.child, sig);
     const done = new Promise<void>((resolve) => this.once("exit", () => resolve()));
     signalGroup("SIGTERM");
     const timer = setTimeout(() => signalGroup("SIGKILL"), graceMs);

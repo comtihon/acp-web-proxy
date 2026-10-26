@@ -2,11 +2,14 @@
  * Proxy configuration.
  *
  * Loaded from a YAML/JSON file (`--config` or ACP_PROXY_CONFIG). Any string
- * value of the form `env:NAME` is replaced with that environment variable, so
- * secrets stay out of the file.
+ * value of the form `env:NAME` is replaced with that environment variable, and
+ * `file:PATH` with the trimmed contents of that file, so secrets stay out of
+ * the config itself.
  */
 
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 export interface HookSpec {
@@ -48,8 +51,22 @@ export interface DialSpec {
   token?: string;
   runner_id: string;
   labels?: Record<string, string>;
-  /** Seconds between reconnect attempts of the control socket. */
+  /** First delay before reconnecting the control socket; doubles up to reconnect_max_s. */
   reconnect_s?: number;
+  reconnect_max_s?: number;
+}
+
+/**
+ * What a client may decide about the agent's local environment. A runner on a
+ * developer machine executes what the remote client asks, so `install` turns
+ * both off: the client then cannot pick local commands (stdio MCP servers) or
+ * set environment variables (PATH, NODE_OPTIONS, …) for the agent.
+ */
+export interface PolicySpec {
+  /** Honour `env` in `_proxy/launch`. */
+  allow_launch_env: boolean;
+  /** Pass stdio (local command) MCP servers in session/new and session/load. */
+  allow_stdio_mcp: boolean;
 }
 
 export interface ProxyConfig {
@@ -68,6 +85,7 @@ export interface ProxyConfig {
   /** Directory for launch configs and per-connection state. */
   state_dir: string;
   dial?: DialSpec | null;
+  policy: PolicySpec;
 }
 
 export const DEFAULTS: Omit<ProxyConfig, "agents" | "default_agent"> = {
@@ -77,8 +95,9 @@ export const DEFAULTS: Omit<ProxyConfig, "agents" | "default_agent"> = {
   idle_timeout_s: 600,
   replay_buffer: 20000,
   max_message_bytes: 32 * 1024 * 1024,
-  state_dir: "/tmp/acp-web-proxy",
+  state_dir: join(tmpdir(), "acp-web-proxy"),
   dial: null,
+  policy: { allow_launch_env: true, allow_stdio_mcp: true },
 };
 
 function resolveEnv<T>(value: T, env: NodeJS.ProcessEnv): T {
@@ -86,6 +105,9 @@ function resolveEnv<T>(value: T, env: NodeJS.ProcessEnv): T {
     if (value.startsWith("env:")) {
       const name = value.slice(4);
       return (env[name] ?? "") as unknown as T;
+    }
+    if (value.startsWith("file:")) {
+      return readFileSync(value.slice(5), "utf8").trim() as unknown as T;
     }
     return value;
   }
@@ -147,7 +169,14 @@ export function normalizeConfig(raw: Record<string, unknown>, env: NodeJS.Proces
   if (r.dial && typeof r.dial === "object") {
     const d = r.dial as Record<string, unknown>;
     if (!d.url || !d.runner_id) throw new Error("config: dial.url and dial.runner_id are required");
-    dial = { url: String(d.url), token: d.token ? String(d.token) : undefined, runner_id: String(d.runner_id), labels: (d.labels as Record<string, string>) ?? {}, reconnect_s: typeof d.reconnect_s === "number" ? d.reconnect_s : 5 };
+    dial = {
+      url: String(d.url),
+      token: d.token ? String(d.token) : undefined,
+      runner_id: String(d.runner_id),
+      labels: (d.labels as Record<string, string>) ?? {},
+      reconnect_s: typeof d.reconnect_s === "number" ? d.reconnect_s : 1,
+      reconnect_max_s: typeof d.reconnect_max_s === "number" ? d.reconnect_max_s : 60,
+    };
   }
   if (!listen && !dial) throw new Error("config: enable `listen`, `dial`, or both");
 
@@ -163,11 +192,19 @@ export function normalizeConfig(raw: Record<string, unknown>, env: NodeJS.Proces
     max_message_bytes: num(r.max_message_bytes, DEFAULTS.max_message_bytes),
     state_dir: (r.state_dir as string) ?? DEFAULTS.state_dir,
     dial,
+    policy: {
+      allow_launch_env: bool((r.policy as Record<string, unknown> | undefined)?.allow_launch_env, true),
+      allow_stdio_mcp: bool((r.policy as Record<string, unknown> | undefined)?.allow_stdio_mcp, true),
+    },
   };
   if (cfg.listen && cfg.tokens.length === 0 && !cfg.allow_unauthenticated) {
     throw new Error("config: listen mode needs `tokens` (or allow_unauthenticated: true for local development)");
   }
   return cfg;
+}
+
+function bool(v: unknown, d: boolean): boolean {
+  return typeof v === "boolean" ? v : d;
 }
 
 function num(v: unknown, d: number): number {

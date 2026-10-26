@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { HookSpec } from "./config.js";
+import { killTree, spawnArgv } from "./spawnCommand.js";
 
 export interface HookResult {
   code: number | null;
@@ -16,15 +17,15 @@ export function runHook(
   cwd?: string,
 ): Promise<HookResult> {
   return new Promise((resolve) => {
-    const [cmd, ...args] = hook.command;
-    const child = spawn(cmd, args, { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnArgv(hook.command, { env, cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     const timeoutMs = (hook.timeout_s ?? 300) * 1000;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      if (process.platform === "win32") killTree(child, "SIGKILL");
+      else child.kill("SIGKILL");
     }, timeoutMs);
     child.stdout.setEncoding("utf8").on("data", (c: string) => { stdout += c; });
     child.stderr.setEncoding("utf8").on("data", (c: string) => { stderr = (stderr + c).slice(-64 * 1024); });

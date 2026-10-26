@@ -25,7 +25,7 @@ rl.on("line", async (line) => {
       send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: false }, agentInfo: { name: "fake", env: process.env.FAKE_MARK ?? null, cwd: process.cwd() } } });
       break;
     case "session/new":
-      send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1" } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1", _meta: { mcpServers: (msg.params?.mcpServers ?? []).map((s) => s.name) } } });
       break;
     case "session/prompt": {
       const text = msg.params?.prompt?.[0]?.text ?? "";

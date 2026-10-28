@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import { normalizeConfig, type ProxyConfig } from "../src/config.js";
 import { startServer, type ListenHandle } from "../src/server.js";
@@ -264,5 +267,112 @@ describe("config", () => {
     expect(c.agents.a.command).toEqual(["x", "--y"]);
     expect(() => normalizeConfig({ agents: { a: { command: "x" } } }, {})).toThrow(/tokens/);
     expect(() => normalizeConfig({ tokens: ["t"], agents: {} }, {})).toThrow(/at least one agent/);
+  });
+});
+
+describe("workspace sync", () => {
+  /** An object store stand-in: GET /ws serves `archive` (404 when unset), PUT /ws stores the body. */
+  async function store(archive: Buffer | null) {
+    const state = { archive, gets: 0, puts: [] as Array<{ body: Buffer; type: string | undefined; mark: string | undefined }> };
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c)).on("end", () => {
+        if (req.method === "GET") {
+          state.gets++;
+          if (!state.archive) return res.writeHead(404).end("NoSuchKey");
+          return res.writeHead(200).end(state.archive);
+        }
+        state.puts.push({ body: Buffer.concat(chunks), type: req.headers["content-type"], mark: req.headers["x-mark"] as string | undefined });
+        state.archive = Buffer.concat(chunks);
+        res.writeHead(200).end();
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    handles.push({ close: () => new Promise<void>((r) => server.close(() => r())) });
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/ws`;
+    return { state, url };
+  }
+
+  function tarOf(files: Record<string, string>): Buffer {
+    const src = mkdtempSync(join(tmpdir(), "acpwp-src-"));
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(src, name), body);
+    const out = join(mkdtempSync(join(tmpdir(), "acpwp-tar-")), "a.tar.gz");
+    execFileSync("tar", ["-czf", out, "-C", src, "."]);
+    return readFileSync(out);
+  }
+
+  function untar(archive: Buffer): string {
+    const dir = mkdtempSync(join(tmpdir(), "acpwp-out-"));
+    const file = join(dir, "..", `${dir.split(/[\\/]/).pop()}.tar.gz`);
+    writeFileSync(file, archive);
+    execFileSync("tar", ["-xzf", file, "-C", dir]);
+    return dir;
+  }
+
+  it("restores the directory before launch and uploads it after every turn", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const dir = join(root, "run-1");
+    const { state, url } = await store(tarOf({ "model.obj": "v 0 0 0", "skip.jpg": "photo" }));
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    const launched = await c.call(1, "_proxy/launch", {
+      config: { workspace: { dir, download_url: url, upload_url: url, upload_headers: { "x-mark": "signed" }, exclude: ["*.jpg"] } },
+    });
+    expect(launched.result.workspace).toEqual({ dir, restore: "restored" });
+    expect(readFileSync(join(dir, "model.obj"), "utf8")).toBe("v 0 0 0");
+
+    writeFileSync(join(dir, "simplified.obj"), "v 1 1 1");
+    await c.call(2, "initialize", {});
+    await c.call(3, "session/prompt", prompt("chunks=1"));
+    const iNote = c.frames.findIndex((f) => f.method === "_proxy/workspace");
+    const iDone = c.frames.findIndex((f) => f.id === 3 && !f.method);
+    expect(iNote).toBeGreaterThanOrEqual(0);
+    expect(iNote).toBeLessThan(iDone);
+    expect(c.frames[iNote].params).toMatchObject({ event: "uploaded", dir });
+    expect(state.puts).toHaveLength(1);
+    expect(state.puts[0]).toMatchObject({ type: "application/gzip", mark: "signed" });
+    const out = untar(state.puts[0].body);
+    expect(readFileSync(join(out, "simplified.obj"), "utf8")).toBe("v 1 1 1");
+    expect(existsSync(join(out, "skip.jpg"))).toBe(false);
+  });
+
+  it("starts empty when nothing was uploaded yet, and keeps a directory that has work in it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const dir = join(root, "run-2");
+    const { state, url } = await store(null);
+    const h = await serve(cfg({ workspace_root: root }));
+    const c1 = await Client.open(h.port);
+    expect((await c1.call(1, "_proxy/launch", { config: { workspace: { dir, download_url: url } } })).result.workspace.restore).toBe("empty");
+    expect(existsSync(dir)).toBe(true);
+
+    writeFileSync(join(dir, "local.txt"), "newer than the store");
+    state.archive = tarOf({ "local.txt": "older" });
+    const c2 = await Client.open(h.port);
+    expect((await c2.call(1, "_proxy/launch", { config: { workspace: { dir, download_url: url } } })).result.workspace.restore).toBe("kept");
+    expect(readFileSync(join(dir, "local.txt"), "utf8")).toBe("newer than the store");
+    expect(state.gets).toBe(1);
+  });
+
+  it("reports a failed upload without failing the turn", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    await c.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, "r"), upload_url: "http://127.0.0.1:1/nowhere" } } });
+    await c.call(2, "initialize", {});
+    const done = await c.call(3, "session/prompt", prompt("chunks=1"));
+    expect(done.result.stopReason).toBe("end_turn");
+    expect(c.frames.find((f) => f.method === "_proxy/workspace")?.params.event).toBe("upload_failed");
+  });
+
+  it("refuses a directory outside the workspace root, or no root at all", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    const outside = await c.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, "..", "elsewhere") } } });
+    expect(outside.error.message).toMatch(/inside/);
+    const h2 = await serve(cfg());
+    const c2 = await Client.open(h2.port);
+    const noRoot = await c2.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, "x") } } });
+    expect(noRoot.error.message).toMatch(/workspace_root/);
   });
 });

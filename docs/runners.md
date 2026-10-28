@@ -117,9 +117,37 @@ policy:
 
 A runner executes what carrier asks on the user's machine; these keep carrier
 from choosing local commands or environment. Carrier also never sends its own
-credentials (tool env) to a runner. Agents still answer permission requests
-automatically during a run, as they do in pods: connect a machine only for
-agents you are happy to let carrier's workflows drive.
+credentials to a runner: no step `env_vars`, no backend API keys, no tool
+secrets. What an agent is granted does travel: a data source grant (scoped to
+the run and its ticked operations, valid for `DATASOURCE_GRANT_TTL_SECONDS`)
+and the bearer tokens of the HTTP MCP servers its `mcp` addon enables. Agents
+still answer permission requests automatically during a run, as they do in
+pods: connect a machine only for agents you are happy to let carrier's
+workflows drive.
+
+## Isolation between agents on one machine
+
+Carrier scopes grants **per agent definition**: each step gets its own agent
+process and only the MCP servers and data source operations of its own
+agent's addons in `session/new`. That separation holds inside carrier's
+protocol only. On the machine, every agent the runner starts:
+
+- runs as **the same OS user** with a shell, so it can read whatever that user
+  can — other runs' directories under `workspace_root`, files an agent wrote
+  its tokens to, environment variables of the user's other processes, and the
+  user's own credentials (`~/.config/gcloud`, `~/.codex`, `~/.claude`, …);
+- loads **the user's own agent configuration**: MCP servers configured locally
+  (`~/.claude.json`, `~/.codex/config.toml`, project `.mcp.json`) and
+  connectors are available to every agent on the machine, whatever its addons
+  in carrier say.
+
+So treat a machine as **one trust domain**: anything granted to one agent on
+it — and anything the user has configured locally — is reachable by every
+agent that runs there. Put agents that must not share access on different
+machines (or OS users). To keep local MCP servers out of runner agents, give
+the runner's agents their own configuration directory in `config.yaml`
+(`agents.<name>.env`: `CODEX_HOME` holding only `auth.json`, or
+`CLAUDE_CONFIG_DIR` with only the login).
 
 ## Workspace
 
@@ -127,6 +155,13 @@ agents you are happy to let carrier's workflows drive.
 `_proxy/register` and creates a session's `cwd` when it lies inside it.
 Carrier runs each step in `<workspace>/<run_id>` unless the agent sets
 `agent_input.acp_cwd` (e.g. a checkout of your repository).
+
+When the agent has an `s3` addon, carrier passes signed URLs in
+`config.workspace` and the runner restores the step directory from the run's
+workspace archive before the agent starts and uploads it after every turn
+(README, *Workspace sync*) — the same archive a pod agent of that run uses.
+Parallel steps of one run share the directory and the archive: the last
+upload wins.
 
 ## Usage limits
 

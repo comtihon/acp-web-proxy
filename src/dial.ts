@@ -27,7 +27,7 @@ import type { ProxyConfig } from "./config.js";
 import { ConnectionRegistry, bindSocket } from "./server.js";
 import type { Logger } from "./log.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 export const CLOSE_REVOKED = 4403;
 export const CLOSE_UNAUTHORIZED = 4401;

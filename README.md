@@ -100,12 +100,49 @@ A connection with no socket attached is shut down after `idle_timeout_s`.
 
 | Method | Params | Result |
 |---|---|---|
-| `_proxy/launch` | `{agent?, config?, env?}` | `{connection_id, agent, pid}` — runs `prepare`, starts the agent. Optional: the first ACP frame auto-launches the default agent with no config. |
+| `_proxy/launch` | `{agent?, config?, env?}` | `{connection_id, agent, pid, workspace?}` — restores `config.workspace` (see [Workspace sync](#workspace-sync)), runs `prepare`, starts the agent. Optional: the first ACP frame auto-launches the default agent with no config. |
 | `_proxy/status` | – | `{agent, pid, running, exit, stderr_tail, last_seq}` |
 | `_proxy/shutdown` | – | `{}`; stops the agent, runs `shutdown`, ends the connection |
 
-Notification: `_proxy/agent_exited {code, signal, stderr_tail}`. Requests the
-agent never answered are failed with JSON-RPC error `-32603` when it exits.
+Notifications: `_proxy/agent_exited {code, signal, stderr_tail}`, and
+`_proxy/workspace {event: "uploaded", dir, bytes}` or `{event: "upload_failed",
+dir, error}` just before each `session/prompt` response when workspace sync is
+on. Requests the agent never answered are failed with JSON-RPC error `-32603`
+when it exits.
+
+### Workspace sync
+
+A client can have the proxy bring a session's working directory with it — the
+same thing a pod's agent does when it restores its workspace from a bucket —
+without the machine holding any storage credentials:
+
+```json
+{"workspace": {
+  "dir": "/home/me/carrier-workspaces/run-42",
+  "download_url": "https://storage.example.com/…/workspace.tar.gz?signature=…",
+  "upload_url":   "https://storage.example.com/…/workspace.tar.gz?signature=…",
+  "upload_headers": {"content-type": "application/gzip"},
+  "exclude": ["*.jpg"]
+}}
+```
+
+passed as `_proxy/launch` `config`. The archive is a gzipped tar of `dir`'s
+contents; the URLs are plain HTTP (typically pre-signed object-storage URLs),
+so the proxy knows no storage provider.
+
+- **Restore**, before `prepare` and the agent start: `GET download_url` and
+  extract into `dir`. A 404 means nothing was uploaded yet and `dir` starts
+  empty. A `dir` that already has files is **kept** (a relaunch of the same run
+  — its files are at least as new as the last upload). The launch result
+  reports `workspace: {dir, restore: "restored" | "empty" | "kept"}`; a failed
+  download fails the launch.
+- **Upload**, after every turn and before `after_prompt`: tar `dir` (minus
+  `exclude` patterns) and `PUT upload_url` with `upload_headers`. The turn's
+  response is held until it is done; a failure is reported in
+  `_proxy/workspace`, not as a failed turn.
+- `dir` must lie inside `workspace_root`; without one, workspace sync is
+  refused. Both URLs are optional. Needs `tar` on `PATH` (built into Linux,
+  macOS and Windows 10+).
 
 ### Hooks
 

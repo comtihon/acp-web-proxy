@@ -11,11 +11,15 @@
  * Methods under `_proxy/` (ACP reserves the `_` prefix for extensions) are
  * answered by the proxy and never reach the agent:
  *
- *   _proxy/launch   {agent?, config?, env?} → {connection_id, agent, pid}
+ *   _proxy/launch   {agent?, config?, env?} → {connection_id, agent, pid, workspace?}
  *   _proxy/status   → {agent, pid, running, exit, stderr_tail}
  *   _proxy/shutdown → {} and the agent is stopped
  *
- * and the proxy may notify `_proxy/agent_exited` {code, signal, stderr_tail}.
+ * and the proxy may notify `_proxy/agent_exited` {code, signal, stderr_tail} and
+ * `_proxy/workspace` {event: "uploaded", bytes} | {event: "upload_failed", error}.
+ *
+ * `config.workspace` asks for workspace sync (see ./workspace.ts): the
+ * directory is restored before the agent starts and uploaded after every turn.
  */
 
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -24,6 +28,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentSpec, ProxyConfig } from "./config.js";
 import { AgentProcess } from "./agentProcess.js";
 import { parsePrepareOutput, runHook } from "./hooks.js";
+import { parseWorkspaceSync, persistWorkspace, restoreWorkspace, type RestoreOutcome, type WorkspaceSync } from "./workspace.js";
 import type { Logger } from "./log.js";
 
 export class ReplayGapError extends Error {}
@@ -58,6 +63,8 @@ export class Connection {
   private closed = false;
   private stateDir: string;
   private hookEnv: Record<string, string> = {};
+  private workspace: WorkspaceSync | null = null;
+  private restored: RestoreOutcome | null = null;
   onClose: (() => void) | null = null;
 
   constructor(
@@ -115,14 +122,19 @@ export class Connection {
 
   // ── outbound (to client) ─────────────────────────────────────────────────
 
-  /** Queue a frame to the client; order is preserved across held frames. */
-  private emit(frame: string, before?: () => Promise<void>): void {
+  /**
+   * Queue a frame to the client; order is preserved across held frames.
+   * `before` may return frames to send ahead of this one.
+   */
+  private emit(frame: string, before?: () => Promise<string[] | void>): void {
     this.outbound = this.outbound.then(async () => {
-      if (before) await before();
-      const seq = ++this.nextSeq;
-      this.outbox.push({ seq, frame });
-      if (this.outbox.length > this.cfg.replay_buffer) this.outbox.splice(0, this.outbox.length - this.cfg.replay_buffer);
-      this.sink?.(frame, seq);
+      const first = (before ? await before() : undefined) ?? [];
+      for (const f of [...first, frame]) {
+        const seq = ++this.nextSeq;
+        this.outbox.push({ seq, frame: f });
+        if (this.outbox.length > this.cfg.replay_buffer) this.outbox.splice(0, this.outbox.length - this.cfg.replay_buffer);
+        this.sink?.(f, seq);
+      }
     }).catch((err) => this.log.error("emit failed", { connection: this.id, err: String(err) }));
   }
 
@@ -224,7 +236,12 @@ export class Connection {
         }
         const err = await this.launch(params);
         if (err) this.respondError(msg.id, -32603, err, { stderr_tail: this.agent?.stderrTail });
-        else this.respond(msg.id, { connection_id: this.id, agent: this.agentName, pid: this.agent?.pid });
+        else this.respond(msg.id, {
+          connection_id: this.id,
+          agent: this.agentName,
+          pid: this.agent?.pid,
+          ...(this.restored ? { workspace: { dir: this.workspace?.dir, restore: this.restored } } : {}),
+        });
         return;
       }
       case "_proxy/status":
@@ -280,6 +297,19 @@ export class Connection {
       callerEnv = {};
     }
 
+    const ws = parseWorkspaceSync((launchConfig as Record<string, unknown>).workspace, this.cfg.workspace_root);
+    if (typeof ws === "string") return ws;
+    if (ws) {
+      try {
+        this.restored = await restoreWorkspace(ws, this.stateDir);
+      } catch (e) {
+        this.log.error("workspace restore failed", { connection: this.id, dir: ws.dir, err: String(e) });
+        return `workspace restore failed: ${(e as Error).message}`;
+      }
+      this.workspace = ws;
+      this.log.info("workspace ready", { connection: this.id, dir: ws.dir, restore: this.restored });
+    }
+
     if (spec.hooks?.prepare) {
       const res = await runHook(spec.hooks.prepare, JSON.stringify(launchConfig), { ...this.hookEnv, ...callerEnv }, cwd);
       if (res.code !== 0) {
@@ -319,18 +349,38 @@ export class Connection {
       const method = this.pending.get(idKey(msg!.id));
       this.pending.delete(idKey(msg!.id));
       const hook = this.agentName ? this.cfg.agents[this.agentName]?.hooks?.after_prompt : undefined;
-      if (method === "session/prompt" && hook) {
-        // Hold the end of the turn until the hook (e.g. workspace upload) is done.
+      const ws = this.workspace?.upload_url ? this.workspace : null;
+      if (method === "session/prompt" && (hook || ws)) {
+        // Hold the end of the turn until the workspace upload and the hook are done.
         this.emit(frame, async () => {
-          const res = await runHook(hook, frame, this.hookEnv);
-          if (res.code !== 0) {
-            this.log.error("after_prompt hook failed", { connection: this.id, code: res.code, stderr: res.stderr.slice(-2000) });
+          const first: string[] = [];
+          if (ws) first.push(await this.uploadWorkspace(ws));
+          if (hook) {
+            const res = await runHook(hook, frame, this.hookEnv);
+            if (res.code !== 0) {
+              this.log.error("after_prompt hook failed", { connection: this.id, code: res.code, stderr: res.stderr.slice(-2000) });
+            }
           }
+          return first;
         });
         return;
       }
     }
     this.emit(frame);
+  }
+
+  /** Upload the workspace; the `_proxy/workspace` notification that reports it. */
+  private async uploadWorkspace(ws: WorkspaceSync): Promise<string> {
+    let params: Record<string, unknown>;
+    try {
+      const bytes = await persistWorkspace(ws, this.stateDir);
+      this.log.info("workspace uploaded", { connection: this.id, dir: ws.dir, bytes });
+      params = { event: "uploaded", dir: ws.dir, bytes };
+    } catch (e) {
+      this.log.error("workspace upload failed", { connection: this.id, dir: ws.dir, err: String(e) });
+      params = { event: "upload_failed", dir: ws.dir, error: (e as Error).message };
+    }
+    return JSON.stringify({ jsonrpc: "2.0", method: "_proxy/workspace", params });
   }
 
   private exitInfo() {

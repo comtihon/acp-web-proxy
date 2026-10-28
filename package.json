@@ -1,6 +1,6 @@
 {
   "name": "acp-web-proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Serve a local ACP (Agent Client Protocol) agent over WebSocket: relay, reconnect with replay, launch hooks, dial-out runners.",
   "license": "MIT",
   "type": "module",

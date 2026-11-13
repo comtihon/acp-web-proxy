@@ -16,7 +16,8 @@
  *   _proxy/shutdown → {} and the agent is stopped
  *
  * and the proxy may notify `_proxy/agent_exited` {code, signal, stderr_tail} and
- * `_proxy/workspace` {event: "uploaded", bytes} | {event: "upload_failed", error}.
+ * `_proxy/workspace` {event: "uploaded", dir, bytes, changes} | {event: "unchanged", dir}
+ * | {event: "upload_failed", dir, error}.
  *
  * `config.workspace` asks for workspace sync (see ./workspace.ts): the
  * directory is restored before the agent starts and uploaded after every turn.
@@ -28,7 +29,17 @@ import { randomUUID } from "node:crypto";
 import type { AgentSpec, ProxyConfig } from "./config.js";
 import { AgentProcess } from "./agentProcess.js";
 import { parsePrepareOutput, runHook } from "./hooks.js";
-import { parseWorkspaceSync, persistWorkspace, restoreWorkspace, type RestoreOutcome, type WorkspaceSync } from "./workspace.js";
+import {
+  buildManifest,
+  diffManifests,
+  parseWorkspaceSync,
+  persistWorkspace,
+  restoreWorkspace,
+  writeSyncRecord,
+  type Manifest,
+  type RestoreResult,
+  type WorkspaceSync,
+} from "./workspace.js";
 import type { Logger } from "./log.js";
 
 export class ReplayGapError extends Error {}
@@ -64,7 +75,9 @@ export class Connection {
   private stateDir: string;
   private hookEnv: Record<string, string> = {};
   private workspace: WorkspaceSync | null = null;
-  private restored: RestoreOutcome | null = null;
+  private restored: RestoreResult | null = null;
+  /** The workspace as last synced with the archive; a turn's changes are counted against it. */
+  private baseline: Manifest = {};
   onClose: (() => void) | null = null;
 
   constructor(
@@ -240,7 +253,7 @@ export class Connection {
           connection_id: this.id,
           agent: this.agentName,
           pid: this.agent?.pid,
-          ...(this.restored ? { workspace: { dir: this.workspace?.dir, restore: this.restored } } : {}),
+          ...(this.restored ? { workspace: { dir: this.workspace?.dir, restore: this.restored.outcome, files: this.restored.files } } : {}),
         });
         return;
       }
@@ -307,7 +320,8 @@ export class Connection {
         return `workspace restore failed: ${(e as Error).message}`;
       }
       this.workspace = ws;
-      this.log.info("workspace ready", { connection: this.id, dir: ws.dir, restore: this.restored });
+      this.baseline = this.restored.baseline;
+      this.log.info("workspace ready", { connection: this.id, dir: ws.dir, restore: this.restored.outcome, files: this.restored.files });
     }
 
     if (spec.hooks?.prepare) {
@@ -373,9 +387,22 @@ export class Connection {
   private async uploadWorkspace(ws: WorkspaceSync): Promise<string> {
     let params: Record<string, unknown>;
     try {
-      const bytes = await persistWorkspace(ws, this.stateDir);
-      this.log.info("workspace uploaded", { connection: this.id, dir: ws.dir, bytes });
-      params = { event: "uploaded", dir: ws.dir, bytes };
+      const manifest = buildManifest(ws.dir, ws.exclude ?? []);
+      const diff = diffManifests(this.baseline, manifest);
+      if (diff.added.length + diff.modified.length + diff.deleted.length === 0) {
+        this.log.info("workspace unchanged; upload skipped", { connection: this.id, dir: ws.dir });
+        params = { event: "unchanged", dir: ws.dir };
+      } else {
+        const { bytes, version } = await persistWorkspace(ws, this.stateDir);
+        this.baseline = manifest;
+        try {
+          writeSyncRecord(ws, { dir: ws.dir, version, manifest });
+        } catch (e) {
+          this.log.warn("could not write workspace sync record", { connection: this.id, dir: ws.dir, err: String(e) });
+        }
+        this.log.info("workspace uploaded", { connection: this.id, dir: ws.dir, bytes });
+        params = { event: "uploaded", dir: ws.dir, bytes, changes: changeList(diff) };
+      }
     } catch (e) {
       this.log.error("workspace upload failed", { connection: this.id, dir: ws.dir, err: String(e) });
       params = { event: "upload_failed", dir: ws.dir, error: (e as Error).message };
@@ -419,6 +446,22 @@ export class Connection {
   get isClosed(): boolean {
     return this.closed;
   }
+}
+
+const MAX_CHANGES = 500;
+
+/** A diff for `_proxy/workspace`: each list capped at MAX_CHANGES, counts always present. */
+function changeList(diff: { added: string[]; modified: string[]; deleted: string[] }) {
+  const truncated = diff.added.length > MAX_CHANGES || diff.modified.length > MAX_CHANGES || diff.deleted.length > MAX_CHANGES;
+  return {
+    added: diff.added.slice(0, MAX_CHANGES),
+    modified: diff.modified.slice(0, MAX_CHANGES),
+    deleted: diff.deleted.slice(0, MAX_CHANGES),
+    added_count: diff.added.length,
+    modified_count: diff.modified.length,
+    deleted_count: diff.deleted.length,
+    ...(truncated ? { truncated: true } : {}),
+  };
 }
 
 /** The proxy's own environment minus its secrets. */

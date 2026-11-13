@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, symlinkSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -10,6 +10,7 @@ import { normalizeConfig, type ProxyConfig } from "../src/config.js";
 import { startServer, type ListenHandle } from "../src/server.js";
 import { startDial } from "../src/dial.js";
 import { silentLogger } from "../src/log.js";
+import { buildManifest, diffManifests, globToRegExp, readSyncRecord, restoreWorkspace } from "../src/workspace.js";
 
 const FAKE = resolve(__dirname, "fixtures/fake-agent.mjs");
 const TOKEN = "s3cret";
@@ -273,18 +274,19 @@ describe("config", () => {
 describe("workspace sync", () => {
   /** An object store stand-in: GET /ws serves `archive` (404 when unset), PUT /ws stores the body. */
   async function store(archive: Buffer | null) {
-    const state = { archive, gets: 0, puts: [] as Array<{ body: Buffer; type: string | undefined; mark: string | undefined }> };
+    const state = { archive, generation: 1, gets: 0, puts: [] as Array<{ body: Buffer; type: string | undefined; mark: string | undefined }> };
     const server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c)).on("end", () => {
         if (req.method === "GET") {
           state.gets++;
           if (!state.archive) return res.writeHead(404).end("NoSuchKey");
-          return res.writeHead(200).end(state.archive);
+          return res.writeHead(200, { "x-goog-generation": String(state.generation) }).end(state.archive);
         }
         state.puts.push({ body: Buffer.concat(chunks), type: req.headers["content-type"], mark: req.headers["x-mark"] as string | undefined });
         state.archive = Buffer.concat(chunks);
-        res.writeHead(200).end();
+        state.generation++;
+        res.writeHead(200, { "x-goog-generation": String(state.generation) }).end();
       });
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -318,7 +320,7 @@ describe("workspace sync", () => {
     const launched = await c.call(1, "_proxy/launch", {
       config: { workspace: { dir, download_url: url, upload_url: url, upload_headers: { "x-mark": "signed" }, exclude: ["*.jpg"] } },
     });
-    expect(launched.result.workspace).toEqual({ dir, restore: "restored" });
+    expect(launched.result.workspace).toEqual({ dir, restore: "restored", files: 1 });
     expect(readFileSync(join(dir, "model.obj"), "utf8")).toBe("v 0 0 0");
 
     writeFileSync(join(dir, "simplified.obj"), "v 1 1 1");
@@ -328,7 +330,12 @@ describe("workspace sync", () => {
     const iDone = c.frames.findIndex((f) => f.id === 3 && !f.method);
     expect(iNote).toBeGreaterThanOrEqual(0);
     expect(iNote).toBeLessThan(iDone);
-    expect(c.frames[iNote].params).toMatchObject({ event: "uploaded", dir });
+    expect(c.frames[iNote].params).toEqual({
+      event: "uploaded",
+      dir,
+      bytes: state.puts[0].body.length,
+      changes: { added: ["simplified.obj"], modified: [], deleted: [], added_count: 1, modified_count: 0, deleted_count: 0 },
+    });
     expect(state.puts).toHaveLength(1);
     expect(state.puts[0]).toMatchObject({ type: "application/gzip", mark: "signed" });
     const out = untar(state.puts[0].body);
@@ -353,11 +360,100 @@ describe("workspace sync", () => {
     expect(state.gets).toBe(1);
   });
 
+  it("skips the upload when a turn changed nothing, and reports the changes when it did", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const dir = join(root, "run-3");
+    const { state, url } = await store(tarOf({ "a.txt": "a", "b.txt": "b", "c.jpg": "photo" }));
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    await c.call(1, "_proxy/launch", { config: { workspace: { dir, download_url: url, upload_url: url, exclude: ["*.jpg"] } } });
+    await c.call(2, "initialize", {});
+    await c.call(3, "session/prompt", prompt("chunks=0"));
+    const notes = () => c.frames.filter((f) => f.method === "_proxy/workspace").map((f) => f.params);
+    expect(notes()).toEqual([{ event: "unchanged", dir }]);
+    expect(state.puts).toHaveLength(0);
+
+    writeFileSync(join(dir, "c.jpg"), "excluded edit");
+    await c.call(4, "session/prompt", prompt("chunks=0"));
+    expect(notes()[1]).toEqual({ event: "unchanged", dir });
+
+    writeFileSync(join(dir, "a.txt"), "a, longer now");
+    rmSync(join(dir, "b.txt"));
+    writeFileSync(join(dir, "new.txt"), "n");
+    await c.call(5, "session/prompt", prompt("chunks=0"));
+    expect(notes()[2]).toMatchObject({
+      event: "uploaded",
+      changes: { added: ["new.txt"], modified: ["a.txt"], deleted: ["b.txt"], added_count: 1, modified_count: 1, deleted_count: 1 },
+    });
+    expect(notes()[2].changes.truncated).toBeUndefined();
+    expect(state.puts).toHaveLength(1);
+    expect(readSyncRecord({ dir, root })).toMatchObject({ dir, version: "2" });
+
+    await c.call(6, "session/prompt", prompt("chunks=0"));
+    expect(notes()[3]).toEqual({ event: "unchanged", dir });
+  });
+
+  it("caps the change lists at 500 entries", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const dir = join(root, "run-4");
+    const { url } = await store(null);
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    await c.call(1, "_proxy/launch", { config: { workspace: { dir, download_url: url, upload_url: url } } });
+    for (let i = 0; i < 501; i++) writeFileSync(join(dir, `f${i}`), "x");
+    await c.call(2, "initialize", {});
+    await c.call(3, "session/prompt", prompt("chunks=0"));
+    const p = c.frames.find((f) => f.method === "_proxy/workspace").params;
+    expect(p.changes.added).toHaveLength(500);
+    expect(p.changes).toMatchObject({ added_count: 501, modified_count: 0, deleted_count: 0, truncated: true });
+  });
+
+  it("keeps a directory synced with the current archive, and replaces one whose archive another step changed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const dir = join(root, "run-5");
+    const { state, url } = await store(tarOf({ "a.txt": "v1" }));
+    const tmp = mkdtempSync(join(tmpdir(), "acpwp-tmp-"));
+    const ws = { dir, root, download_url: url };
+    expect((await restoreWorkspace(ws, tmp)).outcome).toBe("restored");
+    expect(readSyncRecord(ws)?.version).toBe("1");
+    expect(existsSync(join(root, ".carrier-sync"))).toBe(true);
+
+    // Same generation: local edits stay and are counted against the recorded manifest.
+    writeFileSync(join(dir, "local.txt"), "mine");
+    const kept = await restoreWorkspace(ws, tmp);
+    expect(kept).toMatchObject({ outcome: "kept", files: 2 });
+    expect(diffManifests(kept.baseline, buildManifest(dir)).added).toEqual(["local.txt"]);
+    expect(readFileSync(join(dir, "local.txt"), "utf8")).toBe("mine");
+
+    // Another step uploaded: the directory takes the new archive.
+    state.archive = tarOf({ "b.txt": "v2" });
+    state.generation = 7;
+    const replaced = await restoreWorkspace(ws, tmp);
+    expect(replaced).toMatchObject({ outcome: "replaced", files: 1 });
+    expect(existsSync(join(dir, "local.txt"))).toBe(false);
+    expect(readFileSync(join(dir, "b.txt"), "utf8")).toBe("v2");
+    expect(readSyncRecord(ws)?.version).toBe("7");
+
+    // The archive is gone: keep the directory, and count everything as a change.
+    state.archive = null;
+    const gone = await restoreWorkspace(ws, tmp);
+    expect(gone).toMatchObject({ outcome: "kept", baseline: {} });
+  });
+
+  it("refuses a directory inside the sync record directory", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
+    const h = await serve(cfg({ workspace_root: root }));
+    const c = await Client.open(h.port);
+    const r = await c.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, ".carrier-sync", "x") } } });
+    expect(r.error.message).toMatch(/carrier-sync/);
+  });
+
   it("reports a failed upload without failing the turn", async () => {
     const root = mkdtempSync(join(tmpdir(), "acpwp-root-"));
     const h = await serve(cfg({ workspace_root: root }));
     const c = await Client.open(h.port);
     await c.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, "r"), upload_url: "http://127.0.0.1:1/nowhere" } } });
+    writeFileSync(join(root, "r", "out.txt"), "work");
     await c.call(2, "initialize", {});
     const done = await c.call(3, "session/prompt", prompt("chunks=1"));
     expect(done.result.stopReason).toBe("end_turn");
@@ -374,5 +470,37 @@ describe("workspace sync", () => {
     const c2 = await Client.open(h2.port);
     const noRoot = await c2.call(1, "_proxy/launch", { config: { workspace: { dir: join(root, "x") } } });
     expect(noRoot.error.message).toMatch(/workspace_root/);
+  });
+});
+
+describe("workspace manifest", () => {
+  it("records files and symlinks, minus exclude patterns, and diffs two manifests", () => {
+    const dir = mkdtempSync(join(tmpdir(), "acpwp-man-"));
+    mkdirSync(join(dir, "src", "deep"), { recursive: true });
+    mkdirSync(join(dir, "node_modules", "x"), { recursive: true });
+    writeFileSync(join(dir, "a.txt"), "aaa");
+    writeFileSync(join(dir, "src", "deep", "b.ts"), "b");
+    writeFileSync(join(dir, "src", "photo.jpg"), "p");
+    writeFileSync(join(dir, "node_modules", "x", "i.js"), "i");
+    writeFileSync(join(dir, "build.log"), "l");
+    symlinkSync("a.txt", join(dir, "link"));
+    utimesSync(join(dir, "a.txt"), 1000, 1000);
+
+    const m = buildManifest(dir, ["*.jpg", "node_modules", "build.?og"]);
+    expect(Object.keys(m).sort()).toEqual(["a.txt", "link", "src/deep/b.ts"]);
+    expect(m["a.txt"]).toBe("3:1000000");
+    expect(m.link).toBe("link:a.txt");
+    expect(Object.keys(buildManifest(dir, ["src/**"])).sort()).toEqual(["a.txt", "build.log", "link", "node_modules/x/i.js"]);
+
+    const diff = diffManifests({ "a.txt": "3:1", "gone.txt": "1:1", "src/deep/b.ts": m["src/deep/b.ts"] }, m);
+    expect(diff).toEqual({ added: ["link"], modified: ["a.txt"], deleted: ["gone.txt"] });
+  });
+
+  it("translates tar-style globs", () => {
+    expect(globToRegExp("*.jpg").test("x.jpg")).toBe(true);
+    expect(globToRegExp("*.jpg").test("d/x.jpg")).toBe(false);
+    expect(globToRegExp("**/*.jpg").test("d/e/x.jpg")).toBe(true);
+    expect(globToRegExp("a?c").test("abc")).toBe(true);
+    expect(globToRegExp("a.c").test("abc")).toBe(false);
   });
 });

@@ -105,9 +105,9 @@ A connection with no socket attached is shut down after `idle_timeout_s`.
 | `_proxy/shutdown` | – | `{}`; stops the agent, runs `shutdown`, ends the connection |
 
 Notifications: `_proxy/agent_exited {code, signal, stderr_tail}`, and
-`_proxy/workspace {event: "uploaded", dir, bytes}` or `{event: "upload_failed",
-dir, error}` just before each `session/prompt` response when workspace sync is
-on. Requests the agent never answered are failed with JSON-RPC error `-32603`
+`_proxy/workspace {event: "uploaded", dir, bytes, changes}`, `{event:
+"unchanged", dir}` or `{event: "upload_failed", dir, error}` just before each
+`session/prompt` response when workspace sync is on. Requests the agent never answered are failed with JSON-RPC error `-32603`
 when it exits.
 
 ### Workspace sync
@@ -133,13 +133,23 @@ so the proxy knows no storage provider.
 - **Restore**, before `prepare` and the agent start: `GET download_url` and
   extract into `dir`. A 404 means nothing was uploaded yet and `dir` starts
   empty. A `dir` that already has files is **kept** (a relaunch of the same run
-  — its files are at least as new as the last upload). The launch result
-  reports `workspace: {dir, restore: "restored" | "empty" | "kept"}`; a failed
+  — its files are at least as new as the last upload) — unless its sync record
+  shows the archive's version (`x-goog-generation`, else `ETag`) changed since
+  this machine last synced it (another step uploaded): then its contents are
+  **replaced** by the archive. The launch result reports `workspace: {dir,
+  restore: "restored" | "empty" | "kept" | "replaced", files}`; a failed
   download fails the launch.
-- **Upload**, after every turn and before `after_prompt`: tar `dir` (minus
-  `exclude` patterns) and `PUT upload_url` with `upload_headers`. The turn's
-  response is held until it is done; a failure is reported in
-  `_proxy/workspace`, not as a failed turn.
+- **Upload**, after every turn and before `after_prompt`: compare `dir` (path,
+  size, mtime; symlinks by target; minus `exclude`) with the last sync. No
+  changes: no upload, `{event: "unchanged"}`. Otherwise tar `dir` (minus
+  `exclude` patterns) and `PUT upload_url` with `upload_headers`, then notify
+  `{event: "uploaded", bytes, changes: {added, modified, deleted, added_count,
+  modified_count, deleted_count, truncated?}}` (sorted relative paths, each list
+  capped at 500). The turn's response is held until it is done; a failure is
+  reported as `upload_failed`, not as a failed turn, and retried next turn.
+- **Sync record**: after each restore and upload the proxy writes
+  `<workspace_root>/.carrier-sync/<sha256(dir)[:16]>.json` = `{dir, version,
+  manifest}` (atomically). `dir` may not lie inside `.carrier-sync`.
 - `dir` must lie inside `workspace_root`; without one, workspace sync is
   refused. Both URLs are optional. Needs `tar` on `PATH` (built into Linux,
   macOS and Windows 10+).

@@ -161,7 +161,11 @@ When the agent has an `s3` addon, carrier passes signed URLs in
 workspace archive before the agent starts and uploads it after every turn
 (README, *Workspace sync*) — the same archive a pod agent of that run uses.
 Parallel steps of one run share the directory and the archive: the last
-upload wins.
+upload wins. A turn that changed no files skips the upload
+(`_proxy/workspace {event: "unchanged"}`); otherwise the `uploaded` event lists
+the added/modified/deleted paths. On relaunch, a non-empty directory is kept
+unless the archive's version moved since this runner last synced it (the record
+in `<workspace_root>/.carrier-sync/`) — then it is `replaced` by the archive.
 
 ## Usage limits
 
